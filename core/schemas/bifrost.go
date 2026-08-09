@@ -705,7 +705,7 @@ func (br *BifrostRequest) GetRequestFields() (provider ModelProvider, model stri
 	case br.ContainerFileDeleteRequest != nil:
 		return br.ContainerFileDeleteRequest.Provider, "", nil
 	case br.PassthroughRequest != nil:
-		return br.PassthroughRequest.Provider, br.PassthroughRequest.Model, nil
+		return br.PassthroughRequest.Provider, br.PassthroughRequest.Model, br.PassthroughRequest.Fallbacks
 	}
 	return "", "", nil
 }
