@@ -8,6 +8,7 @@ type BifrostPassthroughRequest struct {
 	RawQuery    string // raw query string, no "?"
 	Body        []byte
 	SafeHeaders map[string]string // client headers, auth already stripped
+	Fallbacks   []Fallback        `json:"fallbacks,omitempty"` // cost-ordered failover targets (caller sorts cheap→expensive)
 }
 
 // BifrostPassthroughUsage carries usage data extracted by the provider at stream
