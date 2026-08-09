@@ -5008,6 +5008,16 @@ func (bifrost *Bifrost) prepareFallbackRequest(req *schemas.BifrostRequest, fall
 		tmp.Model = fallback.Model
 		fallbackReq.VideoGenerationRequest = &tmp
 	}
+
+	// Clone PassthroughRequest before overriding provider/model. The shallow
+	// fallbackReq := *req above aliases the same pointer, so mutating it in place
+	// would corrupt the primary request between attempts.
+	if req.PassthroughRequest != nil {
+		tmp := *req.PassthroughRequest
+		tmp.Provider = fallback.Provider
+		tmp.Model = fallback.Model
+		fallbackReq.PassthroughRequest = &tmp
+	}
 	return &fallbackReq
 }
 

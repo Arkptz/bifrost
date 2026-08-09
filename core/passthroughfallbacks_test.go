@@ -121,3 +121,44 @@ func TestClassifyPassthroughStatus_429NeverEscalates(t *testing.T) {
 		}
 	}
 }
+
+// TestPrepareFallbackRequest_PassthroughDoesNotMutateOriginal proves the clone
+// branch: preparing a passthrough fallback must not corrupt the primary request's
+// PassthroughRequest, which is aliased through the shallow struct copy.
+func TestPrepareFallbackRequest_PassthroughDoesNotMutateOriginal(t *testing.T) {
+	account := NewMockAccount()
+	account.AddProvider(schemas.OpenAI, 1, 1)
+	bifrost := &Bifrost{account: account, logger: NewDefaultLogger(schemas.LogLevelError)}
+
+	original := &schemas.BifrostPassthroughRequest{
+		Provider: schemas.Anthropic,
+		Model:    "claude-sonnet",
+		Path:     "/v1/messages",
+		Body:     []byte(`{"model":"claude-sonnet"}`),
+	}
+	req := &schemas.BifrostRequest{
+		RequestType:        schemas.PassthroughRequest,
+		PassthroughRequest: original,
+	}
+
+	fallbackReq := bifrost.prepareFallbackRequest(req, schemas.Fallback{Provider: schemas.OpenAI, Model: "gpt-4o"})
+	if fallbackReq == nil {
+		t.Fatal("prepareFallbackRequest returned nil for a configured provider")
+	}
+
+	if original.Provider != schemas.Anthropic {
+		t.Errorf("original provider mutated to %q, want %q", original.Provider, schemas.Anthropic)
+	}
+	if original.Model != "claude-sonnet" {
+		t.Errorf("original model mutated to %q, want %q", original.Model, "claude-sonnet")
+	}
+	if fallbackReq.PassthroughRequest == original {
+		t.Error("fallback PassthroughRequest still aliases the original pointer")
+	}
+	if fallbackReq.PassthroughRequest.Provider != schemas.OpenAI {
+		t.Errorf("fallback provider = %q, want %q", fallbackReq.PassthroughRequest.Provider, schemas.OpenAI)
+	}
+	if fallbackReq.PassthroughRequest.Model != "gpt-4o" {
+		t.Errorf("fallback model = %q, want %q", fallbackReq.PassthroughRequest.Model, "gpt-4o")
+	}
+}
