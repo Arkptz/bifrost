@@ -5101,6 +5101,19 @@ func (bifrost *Bifrost) handleRequest(ctx *schemas.BifrostContext, req *schemas.
 		}
 	}
 
+	// Passthrough failover is status-aware: a non-2xx passthrough travels the
+	// success arm (primaryErr == nil) with the raw upstream status in
+	// PassthroughResponse, so the error-driven fallback loop below never fires
+	// for it. Gate strictly to passthrough so every other request type is
+	// unchanged.
+	if primaryErr == nil && req.RequestType == schemas.PassthroughRequest {
+		final := bifrost.runPassthroughStatusFailover(ctx, req, passthroughStatusResult{resp: primaryResult}, func(attempt *schemas.BifrostRequest) passthroughStatusResult {
+			r, e := bifrost.tryRequest(ctx, attempt)
+			return passthroughStatusResult{resp: r, err: e}
+		})
+		return final.resp, final.err
+	}
+
 	// Check if we should proceed with fallbacks
 	shouldTryFallbacks := bifrost.shouldTryFallbacks(req, primaryErr)
 	if !shouldTryFallbacks {

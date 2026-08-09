@@ -1,7 +1,12 @@
 package bifrost
 
 import (
+	"context"
+	"net/http"
+	"net/http/httptest"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	schemas "github.com/maximhq/bifrost/core/schemas"
 )
@@ -160,5 +165,126 @@ func TestPrepareFallbackRequest_PassthroughDoesNotMutateOriginal(t *testing.T) {
 	}
 	if fallbackReq.PassthroughRequest.Model != "gpt-4o" {
 		t.Errorf("fallback model = %q, want %q", fallbackReq.PassthroughRequest.Model, "gpt-4o")
+	}
+}
+
+func statusHandler(status int, hits *atomic.Int32) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		w.WriteHeader(status)
+		_, _ = w.Write([]byte(`{"ok":false}`))
+	}
+}
+
+func newPassthroughTestClient(t *testing.T, account *MockAccount) *Bifrost {
+	t.Helper()
+	client, err := Init(context.Background(), schemas.BifrostConfig{
+		Account: account,
+		Logger:  NewDefaultLogger(schemas.LogLevelError),
+	})
+	if err != nil {
+		t.Fatalf("failed to initialize bifrost: %v", err)
+	}
+	t.Cleanup(client.Shutdown)
+	return client
+}
+
+// TestPassthroughFailover_5xxEscalates verifies a real upstream 5xx on the cheap
+// primary escalates to the next (more expensive) fallback in the caller-supplied
+// order, which succeeds.
+func TestPassthroughFailover_5xxEscalates(t *testing.T) {
+	var primaryHits, fallbackHits atomic.Int32
+	primary := httptest.NewServer(statusHandler(http.StatusInternalServerError, &primaryHits))
+	defer primary.Close()
+	fallback := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fallbackHits.Add(1)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer fallback.Close()
+
+	account := NewMockAccount()
+	account.AddProviderWithBaseURL(schemas.OpenAI, 1, 1, primary.URL)
+	account.AddProviderWithBaseURL(schemas.Anthropic, 1, 1, fallback.URL)
+	client := newPassthroughTestClient(t, account)
+
+	ctx := schemas.NewBifrostContext(context.Background(), time.Now().Add(30*time.Second))
+	resp, bifrostErr := client.Passthrough(ctx, schemas.OpenAI, &schemas.BifrostPassthroughRequest{
+		Method:    http.MethodPost,
+		Path:      "/v1/messages",
+		Body:      []byte(`{"model":"m"}`),
+		Fallbacks: []schemas.Fallback{{Provider: schemas.Anthropic, Model: "claude-haiku"}},
+	})
+	if bifrostErr != nil {
+		t.Fatalf("Passthrough returned error: %s", bifrostErr.Error.Message)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("final status = %d, want 200 (should escalate to fallback)", resp.StatusCode)
+	}
+	if fallbackHits.Load() == 0 {
+		t.Fatal("fallback provider was never called — 5xx did not escalate")
+	}
+}
+
+// TestPassthroughFailover_429DoesNotEscalate is the money-safety integration
+// guard: a 429 from the cheap primary must NOT jump to the expensive fallback.
+// The upstream 429 body must reach the client verbatim and the fallback provider
+// must never be called.
+func TestPassthroughFailover_429DoesNotEscalate(t *testing.T) {
+	var primaryHits, fallbackHits atomic.Int32
+	primary := httptest.NewServer(statusHandler(http.StatusTooManyRequests, &primaryHits))
+	defer primary.Close()
+	fallback := httptest.NewServer(statusHandler(http.StatusOK, &fallbackHits))
+	defer fallback.Close()
+
+	account := NewMockAccount()
+	account.AddProviderWithBaseURL(schemas.OpenAI, 1, 1, primary.URL)
+	account.AddProviderWithBaseURL(schemas.Anthropic, 1, 1, fallback.URL)
+	client := newPassthroughTestClient(t, account)
+
+	ctx := schemas.NewBifrostContext(context.Background(), time.Now().Add(30*time.Second))
+	resp, bifrostErr := client.Passthrough(ctx, schemas.OpenAI, &schemas.BifrostPassthroughRequest{
+		Method:    http.MethodPost,
+		Path:      "/v1/messages",
+		Body:      []byte(`{"model":"m"}`),
+		Fallbacks: []schemas.Fallback{{Provider: schemas.Anthropic, Model: "claude-haiku"}},
+	})
+	if bifrostErr != nil {
+		t.Fatalf("Passthrough returned error: %s", bifrostErr.Error.Message)
+	}
+	if resp.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("final status = %d, want 429 verbatim", resp.StatusCode)
+	}
+	if fallbackHits.Load() != 0 {
+		t.Fatalf("fallback provider was called %d time(s) — 429 must NEVER escalate", fallbackHits.Load())
+	}
+}
+
+// TestPassthroughFailover_NoFallbacksUnchanged is the byte-identity regression
+// guard: with no fallbacks set, a non-2xx passthrough status is returned verbatim
+// exactly as before this feature, with no failover machinery engaged.
+func TestPassthroughFailover_NoFallbacksUnchanged(t *testing.T) {
+	var hits atomic.Int32
+	server := httptest.NewServer(statusHandler(http.StatusInternalServerError, &hits))
+	defer server.Close()
+
+	account := NewMockAccount()
+	account.AddProviderWithBaseURL(schemas.OpenAI, 1, 1, server.URL)
+	client := newPassthroughTestClient(t, account)
+
+	ctx := schemas.NewBifrostContext(context.Background(), time.Now().Add(30*time.Second))
+	resp, bifrostErr := client.Passthrough(ctx, schemas.OpenAI, &schemas.BifrostPassthroughRequest{
+		Method: http.MethodPost,
+		Path:   "/v1/messages",
+		Body:   []byte(`{"model":"m"}`),
+	})
+	if bifrostErr != nil {
+		t.Fatalf("Passthrough returned error: %s", bifrostErr.Error.Message)
+	}
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("final status = %d, want 500 verbatim (no failover without fallbacks)", resp.StatusCode)
+	}
+	if hits.Load() != 1 {
+		t.Fatalf("server hits = %d, want exactly 1 (no retry/escalation without fallbacks)", hits.Load())
 	}
 }
