@@ -533,6 +533,30 @@ func getProviderFromHeader(ctx *fasthttp.RequestCtx, defaultProvider schemas.Mod
 	return schemas.ModelProvider(providerHeader)
 }
 
+// parsePassthroughFallbacks reads cost-ordered failover targets from the
+// x-bf-fallbacks header (comma-separated "provider/model" pairs, caller-sorted
+// cheap→expensive). A header carrier is used instead of body-peeking so the
+// forwarded body reaches upstream byte-identical; the x-bf- prefix is already
+// stripped from SafeHeaders, so this header never leaks to the provider.
+func parsePassthroughFallbacks(ctx *fasthttp.RequestCtx) []schemas.Fallback {
+	raw := string(ctx.Request.Header.Peek("x-bf-fallbacks"))
+	if raw == "" {
+		return nil
+	}
+	var fallbacks []schemas.Fallback
+	for _, entry := range strings.Split(raw, ",") {
+		provider, model, ok := strings.Cut(strings.TrimSpace(entry), "/")
+		if !ok || provider == "" || model == "" {
+			continue
+		}
+		fallbacks = append(fallbacks, schemas.Fallback{
+			Provider: schemas.ModelProvider(provider),
+			Model:    model,
+		})
+	}
+	return fallbacks
+}
+
 func RegisterKVDecoders(store *kvstore.Store) {
 	store.RegisterDecoder("genai_upload_session:", func(data []byte) (any, error) {
 		var v gemini.GeminiResumableUploadSession

@@ -3271,6 +3271,7 @@ func (g *GenericRouter) handlePassthrough(ctx *fasthttp.RequestCtx) {
 		SafeHeaders: safeHeaders,
 		Provider:    provider,
 		Model:       resolvedModel,
+		Fallbacks:   parsePassthroughFallbacks(ctx),
 	}
 
 	if isStreaming {
