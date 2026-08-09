@@ -206,6 +206,13 @@ func TestPassthroughFailover_5xxEscalates(t *testing.T) {
 	account := NewMockAccount()
 	account.AddProviderWithBaseURL(schemas.OpenAI, 1, 1, primary.URL)
 	account.AddProviderWithBaseURL(schemas.Anthropic, 1, 1, fallback.URL)
+	// The fallback carries an explicit model, so key selection runs the model
+	// filter; default mock keys have an empty Models list (deny-all). Grant the
+	// fallback key wildcard model support so escalation can select it (matches
+	// streamfallback_test.go).
+	account.SetKeysForProvider(schemas.Anthropic, []schemas.Key{
+		{ID: "fallback-key", Value: *schemas.NewSecretVar("sk-fallback"), Models: schemas.WhiteList{"*"}, Weight: 100},
+	})
 	client := newPassthroughTestClient(t, account)
 
 	ctx := schemas.NewBifrostContext(context.Background(), time.Now().Add(30*time.Second))
