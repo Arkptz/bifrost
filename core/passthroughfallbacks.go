@@ -102,6 +102,11 @@ type passthroughStatusResult struct {
 // governance billing dedups correctly. attemptFn issues one attempt against the
 // given request. This is money-critical: 429 retries the same provider and never
 // escalates to a pricier fallback.
+//
+// For streaming passthrough, escalation is resolved before any client-visible
+// byte: the transport reads the first chunk (router.go:3246) — which carries the
+// escalation-resolved status — before committing the body to the wire via
+// SetBodyStream (router.go:3315). See TestPassthroughStreamCommitsBodyOnlyAfterFirstChunk.
 func (bifrost *Bifrost) runPassthroughStatusFailover(
 	ctx *schemas.BifrostContext,
 	req *schemas.BifrostRequest,
