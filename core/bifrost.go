@@ -5248,6 +5248,23 @@ func (bifrost *Bifrost) handleStreamRequest(ctx *schemas.BifrostContext, req *sc
 		}
 	}
 
+	// ponytail: PassthroughStreamRequest does NOT get status-aware failover this
+	// round (FIX-7). The unary path (handleRequest) escalates a non-2xx that
+	// arrives on the success arm via runPassthroughStatusFailover; the streaming
+	// equivalent would have to re-invoke g.client.PassthroughStream from the
+	// transport layer (integrations/router.go handlePassthroughStream, in a
+	// different module), classify the first chunk, and tear down the abandoned
+	// upstream stream — teardown that borders the pooled *fasthttp.RequestCtx /
+	// isNonCancellingContext use-after-free guard which is out of scope. The
+	// escalation window (first-chunk-read before SetBodyStream) is real, but a
+	// half-wired version that leaks the abandoned stream is worse than none, so
+	// this is deliberately deferred rather than half-implemented. Streaming
+	// passthrough continues to use the error-only fallback loop below (which only
+	// fires when PassthroughStream itself returns a BifrostError, never for a 5xx
+	// received as a stream). Upgrade path: add a transport-side failover in
+	// handlePassthroughStream's first-chunk window once client-disconnect teardown
+	// is in scope.
+
 	// Check if we should proceed with fallbacks
 	shouldTryFallbacks := bifrost.shouldTryFallbacks(req, primaryErr)
 	if !shouldTryFallbacks {
