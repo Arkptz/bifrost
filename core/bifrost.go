@@ -8635,6 +8635,28 @@ func (bifrost *Bifrost) selectKeyFromProviderForModelWithPool(ctx *schemas.Bifro
 		return []schemas.Key{selectedKey}, false, nil
 	}
 
+	// Passthrough failover cools keys that just returned 401/403/429 from a pool
+	// account; subtract them so the next same-provider retry picks a different
+	// account. Never empty the pool — if every key is cooled, ignore cooling and
+	// let weighted random run (a stale cool must not deny all keys).
+	if ctx != nil {
+		if cooled, ok := ctx.Value(schemas.BifrostContextKeyPassthroughCooledKeyIDs).([]string); ok && len(cooled) > 0 {
+			cool := make(map[string]bool, len(cooled))
+			for _, id := range cooled {
+				cool[id] = true
+			}
+			warm := make([]schemas.Key, 0, len(supportedKeys))
+			for _, k := range supportedKeys {
+				if !cool[k.ID] {
+					warm = append(warm, k)
+				}
+			}
+			if len(warm) > 0 {
+				supportedKeys = warm
+			}
+		}
+	}
+
 	// Normal case: return the full filtered pool with rotation enabled.
 	return supportedKeys, true, nil
 }
