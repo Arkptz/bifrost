@@ -66,13 +66,16 @@ func TestClassifyPassthroughStatus(t *testing.T) {
 		{"201 created", 201, normalMs, passthroughNotFailure},
 		{"204 no content", 204, normalMs, passthroughNotFailure},
 
-		// Fail fast — request-bound 4xx, retrying/escalating cannot help.
+		// Fail fast — genuinely request-bound 4xx, retrying/escalating cannot help.
 		{"400 bad request", 400, normalMs, passthroughFailFast},
-		{"401 unauthorized", 401, normalMs, passthroughFailFast},
-		{"403 forbidden", 403, normalMs, passthroughFailFast},
 		{"404 not found", 404, normalMs, passthroughFailFast},
 		{"409 conflict", 409, normalMs, passthroughFailFast},
 		{"422 unprocessable", 422, normalMs, passthroughFailFast},
+
+		// 401/403 — reseller/gateway pool-account symptom: retry SAME provider
+		// with a cooled key, never escalate (NEW REQ). NOT fail-fast.
+		{"401 unauthorized pooled retry", 401, normalMs, passthroughRetrySamePooled},
+		{"403 forbidden pooled retry", 403, normalMs, passthroughRetrySamePooled},
 
 		// Retry same provider — transient request-timing 4xx.
 		{"408 request timeout", 408, normalMs, passthroughRetrySame},
