@@ -392,3 +392,55 @@ func TestPassthroughStream_ForwardedChunksCarryDistinctIndex(t *testing.T) {
 		t.Fatalf("%d of %d forwarded chunks carry ChunkIndex 0 (%v) — consumers treat index 0 as first-token, so every such chunk's cumulative latency is recorded as TTFT", zeros, len(idx), idx)
 	}
 }
+
+// HANDLE CLEANUP. StreamPassthrough stashes the connection handle on the context so closers
+// can unblock a parked read, and clears it in the reader's defer. The clear is what keeps the
+// "conn released => no handle" invariant true: a stale handle outliving its stream could be
+// read by a later owner on a reused context, after fasthttp has returned that conn to its
+// pool. Deleting the deferred clear left the entire passthrough/stream suite green, so the
+// invariant shipped unguarded. Discriminator (revert-proof): drop the ClearValue and the
+// handle is still on the context after the stream completes.
+func TestPassthroughStream_ConnHandleClearedAfterStream(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		fl, _ := w.(http.Flusher)
+		fmt.Fprint(w, "data: CHUNK\n\n")
+		if fl != nil {
+			fl.Flush()
+		}
+	}))
+	defer srv.Close()
+
+	account := NewMockAccount()
+	account.AddProviderWithBaseURL(schemas.OpenAI, 1, 1, srv.URL)
+	account.SetKeysForProvider(schemas.OpenAI, []schemas.Key{
+		{ID: "k", Value: *schemas.NewSecretVar("sk-k"), Models: schemas.WhiteList{"*"}, Weight: 100},
+	})
+	client := newPassthroughTestClient(t, account)
+
+	ctx := schemas.NewBifrostContext(context.Background(), time.Now().Add(30*time.Second))
+	ch, bifrostErr := client.PassthroughStream(ctx, schemas.OpenAI, &schemas.BifrostPassthroughRequest{
+		Method: http.MethodPost,
+		Path:   "/v1/messages",
+		Body:   []byte(`{"model":"m"}`),
+	})
+	if bifrostErr != nil {
+		t.Fatalf("passthrough stream failed: %s", bifrostErr.Error.Message)
+	}
+	body, status, _ := drainPassthroughStream(ch)
+
+	// Anti-vacuous: the stream must actually have run, or "no handle" is trivially true.
+	if status != http.StatusOK || !strings.Contains(body, "CHUNK") {
+		t.Fatalf("stream did not deliver its body (status=%d body=%q) — test vacuous", status, body)
+	}
+	// The reader's defer chain must have cleared the handle once the conn was released.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if ctx.Value(schemas.BifrostContextKeyStreamConnHandle) == nil {
+			return
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	t.Fatalf("%v still on the context after the stream completed — a stale handle outlives its connection, so a later owner on a reused context could set a read deadline on a conn fasthttp has already pooled for another request",
+		schemas.BifrostContextKeyStreamConnHandle)
+}
