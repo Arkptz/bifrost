@@ -292,6 +292,39 @@ curl -X POST "http://localhost:8080/genai_passthrough/v1/projects/my-project/loc
 
 ---
 
+## Cost-Aware Fallbacks
+
+Pass an `x-bf-fallbacks` header to give a passthrough request a fallback ladder. The value is
+a comma-separated list of `provider/model` pairs, ordered cheapest first:
+
+```bash
+curl -X POST http://localhost:8080/anthropic_passthrough/v1/messages \
+  -H "Content-Type: application/json" \
+  -H "x-bf-fallbacks: anthropic/claude-3-5-haiku-latest,openai/gpt-4o-mini" \
+  -d '{
+    "model": "claude-3-5-haiku-latest",
+    "max_tokens": 64,
+    "messages": [{ "role": "user", "content": "Hello" }]
+  }'
+```
+
+Failover is cost-aware, so a transient problem never promotes a request to a pricier provider
+on its first failure:
+
+- A transient upstream failure (5xx, or a connection error) retries the **same** provider
+  within a bounded budget before the ladder advances.
+- A pool-account symptom (401, 402, 403, 429) retries the same provider on a different key
+  from its pool and never escalates — a bad credential or a rate limit is not a reason to pay
+  a more expensive provider.
+- A terminal, request-bound error (for example 400) is returned verbatim without touching the
+  ladder, because retrying an invalid request cannot help.
+- The total number of upstream attempts across the whole ladder is bounded, so a long
+  fallback list cannot fan out indefinitely.
+
+The response body is forwarded byte-for-byte on every leg, so provider-specific fields such as
+Anthropic `thinking` blocks and image payloads survive a fallback unchanged. Without the
+header, behavior is identical to a plain passthrough request: one upstream call, no retries.
+
 ## Notes
 
 - Use passthrough when you need a provider endpoint that is not directly supported by Bifrost integration routes yet.

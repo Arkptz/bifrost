@@ -1,1 +1,5 @@
+- feat: cost-aware failover for passthrough requests — a transient upstream error retries the same provider within a bounded budget before escalating to a pricier fallback, so a 5xx or a pool 401/403/429 never promotes a cheap provider to an expensive one
+- fix: unblock a parked passthrough stream read via a connection read deadline instead of closing the body stream from a cancellation goroutine, which raced fasthttp's pooled requestStream release
+- fix: carry rejected key IDs across passthrough failover legs so a credential already refused with 401/402/403 is not re-selected while a healthy pool key is available
+- fix: stamp a distinct chunk index on forwarded passthrough stream chunks so cumulative latency stops being recorded as first-token latency
 - fix: patch encrypted reasoning content that providers rejected as unverifiable (#6041)

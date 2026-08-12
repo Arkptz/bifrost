@@ -9262,6 +9262,24 @@
             }
           }
         }
+      ,
+        {
+          "name": "POST /anthropic_passthrough/v1/messages (cost-aware fallbacks via x-bf-fallbacks)",
+          "request": {
+            "method": "POST",
+            "header": [{"key":"Content-Type","value":"application/json"},{"key":"x-bf-fallbacks","value":"anthropic/claude-3-5-haiku-latest,openai/gpt-4o-mini","description":"Ordered cheap->expensive fallback ladder. A transient 5xx or a pool 401/403/429 retries the SAME provider within its bounded budget before the ladder advances, so a cheap provider is never promoted to a pricier one on a first failure."}],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"model\": \"claude-3-5-haiku-latest\",\n  \"max_tokens\": 64,\n  \"messages\": [\n    { \"role\": \"user\", \"content\": \"Hello via Anthropic passthrough with fallbacks.\" }\n  ]\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": {
+              "raw": "{{baseUrl}}/anthropic_passthrough/v1/messages",
+              "host": ["{{baseUrl}}"],
+              "path": ["anthropic_passthrough","v1","messages"]
+            }
+          }
+        }
       ]
     },
     {

@@ -1,5 +1,6 @@
 ## ✨ Features
 
+- **Passthrough Fallbacks** - Passthrough requests accept an `x-bf-fallbacks` header listing provider/model pairs to fall back to. Failover is cost-aware: a transient upstream failure retries the same provider within a bounded budget before advancing the ladder, so a 5xx or a pool 401/403/429 never promotes a cheap provider to a pricier one.
 - **Quarterly Budget Windows** - Budgets support a quarterly reset period, with a configurable fiscal start month so a fiscal year that does not begin in January windows correctly.
 - **Per-Model Budgets and Rate Limits** - Virtual key provider configs accept budgets and rate limits scoped to individual models, surfaced in the UI through a unified budget override manager that groups provider and model budgets together.
 - **Budget Usage Reset** - The reset budget usage flow now covers teams, customers, model limits and provider governance, not just virtual keys.
