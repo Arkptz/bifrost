@@ -5045,9 +5045,14 @@ func (bifrost *Bifrost) handleRequest(ctx *schemas.BifrostContext, req *schemas.
 	defer bifrost.releaseBifrostRequest(req)
 	provider, model, fallbacks := req.GetRequestFields()
 
-	// Handle nil context early to prevent blocking
+	// Handle nil context early to prevent blocking. Isolate a nil-ctx passthrough into a
+	// request-scoped child (see isolatedPassthroughContext) so its failover machinery cannot
+	// stamp per-request keys onto the shared instance context observed by concurrent requests.
 	if ctx == nil {
 		ctx = bifrost.ctx
+		if req.RequestType == schemas.PassthroughRequest {
+			ctx = isolatedPassthroughContext(bifrost.ctx)
+		}
 	}
 
 	// Reset first: bifrost.ctx is shared across every nil-ctx caller.
@@ -5089,6 +5094,12 @@ func (bifrost *Bifrost) handleRequest(ctx *schemas.BifrostContext, req *schemas.
 
 	bifrost.logger.Debug(fmt.Sprintf("primary provider %s with model %s and %d fallbacks", provider, model, len(fallbacks)))
 
+	// Passthrough failover owns its retry accounting via the shared armPassthroughFailover
+	// gate (same gate the streaming twin uses, so the two cannot drift): it pins the inner
+	// retry loop to a single physical call per leg and skips arming on the shared context.
+	passthroughFailover, disarmPassthrough := bifrost.armPassthroughFailover(ctx, req, schemas.PassthroughRequest)
+	defer disarmPassthrough()
+
 	primaryResult, primaryErr := bifrost.tryRequest(ctx, req)
 	if primaryErr != nil {
 		if primaryErr.Error != nil {
@@ -5101,14 +5112,16 @@ func (bifrost *Bifrost) handleRequest(ctx *schemas.BifrostContext, req *schemas.
 		}
 	}
 
-	// Passthrough failover is status-aware: a non-2xx passthrough travels the
-	// success arm (primaryErr == nil) with the raw upstream status in
-	// PassthroughResponse, so the error-driven fallback loop below never fires
-	// for it. Gate strictly to passthrough AND to len(fallbacks) > 0: with no
-	// fallbacks configured the behavior must be byte-identical to upstream — a
-	// single upstream call, the first body returned verbatim, no retry machinery.
-	if primaryErr == nil && req.RequestType == schemas.PassthroughRequest && len(fallbacks) > 0 {
-		final := bifrost.runPassthroughStatusFailover(ctx, req, passthroughStatusResult{resp: primaryResult}, func(attempt *schemas.BifrostRequest) passthroughStatusResult {
+	// Passthrough failover is status-aware and handles BOTH arms via the shared
+	// armPassthroughFailover gate (which fires only for passthrough WITH fallbacks —
+	// with none the behavior stays byte-identical to upstream: one call, verbatim
+	// body, no retry machinery). A non-2xx travels the success arm (primaryErr == nil,
+	// status in PassthroughResponse); a transport error (connection refused) travels
+	// the error arm (primaryErr != nil, status 0). The dedicated loop spends the
+	// same-provider budget on either before escalating cheap→expensive, mirroring the
+	// streaming twin — so the generic escalate-on-any-error loop below is bypassed.
+	if passthroughFailover {
+		final := bifrost.runPassthroughStatusFailover(ctx, req, passthroughStatusResult{resp: primaryResult, err: primaryErr}, func(attempt *schemas.BifrostRequest) passthroughStatusResult {
 			r, e := bifrost.tryRequest(ctx, attempt)
 			return passthroughStatusResult{resp: r, err: e}
 		})
@@ -5200,9 +5213,17 @@ func (bifrost *Bifrost) handleStreamRequest(ctx *schemas.BifrostContext, req *sc
 	defer bifrost.releaseBifrostRequest(req)
 	provider, model, fallbacks := req.GetRequestFields()
 
-	// Handle nil context early to prevent blocking
+	// Handle nil context early to prevent blocking. A nil-ctx passthrough must NOT
+	// share the process-long instance context: its failover machinery stamps per-request
+	// keys (PassthroughSingleAttempt, AttemptBase, FallbackIndex) that a concurrent request
+	// on the shared context would observe. Isolate it in a request-scoped child so the
+	// dedicated money-safe loop runs without mutating shared state. Non-passthrough nil-ctx
+	// keeps the shared context — byte-identical to before.
 	if ctx == nil {
 		ctx = bifrost.ctx
+		if req.RequestType == schemas.PassthroughStreamRequest {
+			ctx = isolatedPassthroughContext(bifrost.ctx)
+		}
 	}
 
 	ctx.ResetUpstreamLatency()
@@ -5236,6 +5257,15 @@ func (bifrost *Bifrost) handleStreamRequest(ctx *schemas.BifrostContext, req *sc
 
 	bifrost.logger.Debug(fmt.Sprintf("primary provider %s with model %s and %d fallbacks", provider, model, len(fallbacks)))
 
+	// Streaming passthrough owns its retry accounting via the shared armPassthroughFailover
+	// gate — the same gate handleRequest uses, so the unary and streaming gates cannot drift.
+	// A nil-ctx passthrough was isolated into a request-scoped child above (!= bifrost.ctx),
+	// so the gate arms for it too and it takes the dedicated money-safe loop rather than the
+	// generic escalate-on-any-error loop. The gate declines only for a no-fallback passthrough
+	// (byte-identical single-call behavior) or a non-passthrough request.
+	passthroughStreamFailover, disarmPassthrough := bifrost.armPassthroughFailover(ctx, req, schemas.PassthroughStreamRequest)
+	defer disarmPassthrough()
+
 	primaryResult, primaryErr := bifrost.tryStreamRequest(ctx, req)
 	if primaryErr != nil {
 		if primaryErr.Error != nil {
@@ -5248,22 +5278,38 @@ func (bifrost *Bifrost) handleStreamRequest(ctx *schemas.BifrostContext, req *sc
 		}
 	}
 
-	// ponytail: PassthroughStreamRequest does NOT get status-aware failover this
-	// round (FIX-7). The unary path (handleRequest) escalates a non-2xx that
-	// arrives on the success arm via runPassthroughStatusFailover; the streaming
-	// equivalent would have to re-invoke g.client.PassthroughStream from the
-	// transport layer (integrations/router.go handlePassthroughStream, in a
-	// different module), classify the first chunk, and tear down the abandoned
-	// upstream stream — teardown that borders the pooled *fasthttp.RequestCtx /
-	// isNonCancellingContext use-after-free guard which is out of scope. The
-	// escalation window (first-chunk-read before SetBodyStream) is real, but a
-	// half-wired version that leaks the abandoned stream is worse than none, so
-	// this is deliberately deferred rather than half-implemented. Streaming
-	// passthrough continues to use the error-only fallback loop below (which only
-	// fires when PassthroughStream itself returns a BifrostError, never for a 5xx
-	// received as a stream). Upgrade path: add a transport-side failover in
-	// handlePassthroughStream's first-chunk window once client-disconnect teardown
-	// is in scope.
+	// Streaming passthrough with fallbacks routes to the dedicated status-aware loop
+	// (runPassthroughStreamFailover), the streaming twin of the unary
+	// runPassthroughStatusFailover: same budgets, same passthroughAttemptCounter, same
+	// Retry-After clamp. The first-chunk peek (passthroughStreamFirstChunkError) already
+	// turned any retry-eligible non-2xx first chunk into primaryErr carrying the upstream
+	// status+headers, so the loop classifies from it — a 429/401/403 retries the SAME
+	// provider within budget and NEVER advances the ladder, only a genuine 5xx escalates.
+	// The generic error-driven fallback loop below (which escalates on ANY error) is the
+	// wrong policy for passthrough and is bypassed here.
+	if passthroughStreamFailover {
+		final := bifrost.runPassthroughStreamFailover(ctx, req,
+			passthroughStreamResult{stream: primaryResult, err: primaryErr},
+			func() passthroughStreamResult {
+				s, e := bifrost.tryStreamRequest(ctx, req)
+				return passthroughStreamResult{stream: s, err: e}
+			},
+			func(fallbackReq *schemas.BifrostRequest) passthroughStreamResult {
+				s, e := bifrost.tryStreamRequest(ctx, fallbackReq)
+				e.SetFallbackRoutingInfo(provider, model)
+				return passthroughStreamResult{stream: s, err: e}
+			},
+		)
+		return final.stream, final.err
+	}
+
+	// Status-aware failover for streaming passthrough is driven from
+	// executeRequestWithRetries: the first-chunk peek (CheckFirstStreamChunkForError)
+	// is handed passthroughStreamFirstChunkError, which turns an escalate-class non-2xx
+	// first chunk into a *BifrostError. That drives primaryErr below, so the same retry
+	// + fallback loop the unary path uses fires here with no transport change — the
+	// abandoned upstream stream is drained on that path (drainDone) and connection_closed
+	// is cleared before the fallback attempt reads its own fresh stream.
 
 	// Check if we should proceed with fallbacks
 	shouldTryFallbacks := bifrost.shouldTryFallbacks(req, primaryErr)
@@ -5933,7 +5979,14 @@ func executeRequestWithRetries[T any](
 	}()
 
 	var currentKey schemas.Key
-	var usedKeyIDs map[string]bool
+	// F2: seed the SOFT skip set from earlier legs of this passthrough failover. Passthrough
+	// pins maxRetries=0, so every leg re-enters this function fresh and a function-local set
+	// forgets across legs — a key already rejected 401 got re-picked while a healthy pool key
+	// sat unused. Seeding usedKeyIDs (not deadKeyIDs) keeps the pool intact: the provider
+	// resets this set when no key is left, so a single-key pool still retries its own key and
+	// a pool 401 can never escalate cheap->expensive. Absent key ⇒ nil ⇒ byte-identical for
+	// every non-passthrough route.
+	usedKeyIDs := loadPassthroughRotatedKeys(ctx)
 	var deadKeyIDs map[string]bool
 	lastWasPerKeyFailure := false
 	// True iff the previous attempt failed with a *permanent* per-key error (401/402/403).
@@ -5960,8 +6013,42 @@ func executeRequestWithRetries[T any](
 	// it. Used to skip backoff: the payload changed, so there is nothing to wait out.
 	lastWasEncryptedContentStrip := false
 
-	for attempts = 0; attempts <= config.NetworkConfig.MaxRetries+extraAttempts; attempts++ {
-		ctx.SetValue(schemas.BifrostContextKeyNumberOfRetries, attempts)
+	// Passthrough failover owns its retry accounting: with the single-attempt
+	// override set, this loop makes exactly one physical call so the outer counter
+	// is the honest upstream bound. attemptBase offsets the stamped index so each
+	// physical leg gets a distinct governance billing identity. Both absent ⇒ 0 /
+	// max_retries, i.e. byte-identical behavior for every non-passthrough route.
+	maxRetries := config.NetworkConfig.MaxRetries
+	if single, _ := ctx.Value(schemas.BifrostContextKeyPassthroughSingleAttempt).(bool); single {
+		maxRetries = 0
+	}
+	attemptBase, _ := ctx.Value(schemas.BifrostContextKeyAttemptBase).(int)
+
+	// Streaming passthrough surfaces a non-2xx upstream status as a data first chunk,
+	// not a BifrostError, so the generic first-chunk peek below can't see it. Supply a
+	// classifier only for a passthrough stream that has fallbacks configured — it
+	// converts an escalate-class (real 5xx) first chunk into a *BifrostError so the
+	// same retry+fallback path a 200-embedded SSE error already takes fires. Gated on
+	// fallbacks so a no-fallback passthrough stream is byte-identical to before (a 5xx
+	// forwards verbatim, single upstream call); every non-passthrough stream passes no
+	// classifier at all. 429/401/403/408 stay nil-classified and never synthesize an
+	// error, so a transient status can never escalate a cheap provider to a pricier one.
+	var streamFirstChunkClassifiers []func(*schemas.BifrostStreamChunk) *schemas.BifrostError
+	if requestType == schemas.PassthroughStreamRequest && req != nil {
+		if _, _, fallbacks := req.GetRequestFields(); len(fallbacks) > 0 {
+			streamFirstChunkClassifiers = append(streamFirstChunkClassifiers, passthroughStreamFirstChunkError)
+		}
+	}
+
+	// extraAttempts is upstream's encrypted-reasoning fail-soft grant. It stays in the
+	// bound so that behaviour is preserved, but it is forced to 0 under the passthrough
+	// pin: passthroughMaxTotalAttempts is only an honest bound if a leg makes exactly one
+	// physical call, and a fail-soft grant would silently add a second.
+	if single, _ := ctx.Value(schemas.BifrostContextKeyPassthroughSingleAttempt).(bool); single {
+		extraAttempts = 0
+	}
+	for attempts = 0; attempts <= maxRetries+extraAttempts; attempts++ {
+		ctx.SetValue(schemas.BifrostContextKeyNumberOfRetries, attemptBase+attempts)
 
 		// Reset the trail on the first attempt so a reused or shared context (bifrost.ctx)
 		// doesn't carry over records from a previous request.
@@ -6285,7 +6372,7 @@ func executeRequestWithRetries[T any](
 		emptyStream := false
 		if bifrostError == nil {
 			if streamChan, ok := any(result).(chan *schemas.BifrostStreamChunk); ok {
-				checkedStream, drainDone, firstChunkErr := providerUtils.CheckFirstStreamChunkForError(ctx, streamChan)
+				checkedStream, drainDone, firstChunkErr := providerUtils.CheckFirstStreamChunkForError(ctx, streamChan, streamFirstChunkClassifiers...)
 				if firstChunkErr != nil {
 					<-drainDone
 					// The dead stream's teardown (ReleaseStreamingResponse) claimed the
@@ -8651,28 +8738,6 @@ func (bifrost *Bifrost) selectKeyFromProviderForModelWithPool(ctx *schemas.Bifro
 		}
 
 		return []schemas.Key{selectedKey}, false, nil
-	}
-
-	// Passthrough failover cools keys that just returned 401/403/429 from a pool
-	// account; subtract them so the next same-provider retry picks a different
-	// account. Never empty the pool — if every key is cooled, ignore cooling and
-	// let weighted random run (a stale cool must not deny all keys).
-	if ctx != nil {
-		if cooled, ok := ctx.Value(schemas.BifrostContextKeyPassthroughCooledKeyIDs).([]string); ok && len(cooled) > 0 {
-			cool := make(map[string]bool, len(cooled))
-			for _, id := range cooled {
-				cool[id] = true
-			}
-			warm := make([]schemas.Key, 0, len(supportedKeys))
-			for _, k := range supportedKeys {
-				if !cool[k.ID] {
-					warm = append(warm, k)
-				}
-			}
-			if len(warm) > 0 {
-				supportedKeys = warm
-			}
-		}
 	}
 
 	// Normal case: return the full filtered pool with rotation enabled.
