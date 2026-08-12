@@ -21,6 +21,11 @@ var reservedKeys = []any{
 	BifrostContextKeySelectedKeyID,
 	BifrostContextKeySelectedKeyName,
 	BifrostContextKeyNumberOfRetries,
+	BifrostContextKeyAttemptBase,
+	BifrostContextKeyPassthroughSingleAttempt,
+	BifrostContextKeyPassthroughRotatedKeys,
+	BifrostContextKeyShutdownDone,
+	BifrostContextKeyStreamConnHandle,
 	BifrostContextKeyFallbackIndex,
 	BifrostContextKeySkipKeySelection,
 	BifrostContextKeyPassthroughHeaders,
@@ -32,7 +37,6 @@ var reservedKeys = []any{
 	BifrostContextKeyMCPHealthCheckRequest,
 	BifrostContextKeyUpstreamLatency,
 	BifrostContextKeyRoutingInfo,
-	BifrostContextKeyPassthroughCooledKeyIDs,
 }
 
 // pluginLogStore holds plugin log entries accumulated during request processing.

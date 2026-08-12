@@ -52,9 +52,19 @@ func StreamPassthrough(
 	rawBodyStream io.Reader,
 	params PassthroughStreamParams,
 ) chan *schemas.BifrostStreamChunk {
+	// Stash the conn handle (keyed by resp's address 4-tuple at dial) BEFORE the
+	// idle-timeout wrapper and cancellation goroutine read it: they set a past read
+	// deadline on it to unblock a parked body read instead of firing fasthttp's
+	// pool-releasing close from a third goroutine (read-after-release). nil when the
+	// provider is not on a headerDeadlineConn (e.g. a plain net.Conn) — the legacy
+	// close-based unblock then applies, unchanged.
+	if h := lookupStreamConn(resp.LocalAddr(), resp.RemoteAddr()); h != nil {
+		ctx.SetValue(schemas.BifrostContextKeyStreamConnHandle, h)
+	}
 	// Wrap reader with idle timeout to detect stalled streams.
 	bodyStream, stopIdleTimeout := NewIdleTimeoutReader(rawBodyStream, rawBodyStream, GetStreamIdleTimeout(ctx), ctx)
-	// Cancellation must close the raw stream to unblock reads.
+	// Cancellation unblocks the raw stream (deadline when a conn handle is present,
+	// else close) to wake a parked read.
 	stopCancellation := SetupStreamCancellation(ctx, rawBodyStream, params.Logger)
 
 	extraFields := schemas.BifrostResponseExtraFields{
@@ -64,6 +74,11 @@ func StreamPassthrough(
 
 	ch := make(chan *schemas.BifrostStreamChunk, schemas.DefaultStreamBufferSize)
 	go func() {
+		// Null the handle LAST (registered first → runs after ReleaseStreamingResponse
+		// and the stop* defers that join the cancellation/timer owners). Makes the
+		// ordering explicit: once the reader has released the conn, no owner may set a
+		// deadline on it — it could by then be back in fasthttp's pool serving another request.
+		defer ctx.ClearValue(schemas.BifrostContextKeyStreamConnHandle)
 		defer EnsureStreamFinalizerCalled(ctx, postHookSpanFinalizer)
 		defer func() {
 			if ctx.Err() == context.Canceled {
@@ -141,18 +156,31 @@ func StreamPassthrough(
 		}
 
 		buf := make([]byte, 4096)
+		chunkIndex := 0
 		for {
 			n, readErr := bodyStream.Read(buf)
 			if n > 0 {
 				chunk := make([]byte, n)
 				copy(chunk, buf[:n])
+				// F3: stamp real elapsed time per forwarded chunk. The failover first-chunk
+				// classifier keys the 502/503 local-fast-fail heuristic (≤3ms) off Latency;
+				// leaving it 0 made every upstream 5xx look like a local fast-fail. finalize
+				// re-stamps its own elapsed value, so this only affects forwarded chunks.
+				chunkFields := extraFields
+				chunkFields.Latency = time.Since(params.StartTime).Milliseconds()
+				// F4: stamp the real chunk ordinal. Consumers key first-token latency off
+				// ChunkIndex == 0 (plugins/telemetry/main.go:799); leaving every forwarded
+				// chunk at 0 fed each chunk's CUMULATIVE elapsed time into the first-token
+				// histogram, so that metric grew with stream length instead of measuring TTFT.
+				chunkFields.ChunkIndex = chunkIndex
+				chunkIndex++
 				// Forward the raw chunk to the client unchanged.
 				ProcessAndSendResponse(ctx, postHookRunner, &schemas.BifrostResponse{
 					PassthroughResponse: &schemas.BifrostPassthroughResponse{
 						StatusCode:  params.StatusCode,
 						Headers:     params.Headers,
 						Body:        chunk,
-						ExtraFields: extraFields,
+						ExtraFields: chunkFields,
 					},
 				}, ch, postHookSpanFinalizer)
 

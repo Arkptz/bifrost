@@ -1357,10 +1357,23 @@ func CloneFastHTTPClientConfig(base *fasthttp.Client) *fasthttp.Client {
 // that closure verbatim, so zeroing the clone's ReadTimeout does not affect dial.
 func BuildStreamingClient(base *fasthttp.Client) *fasthttp.Client {
 	c := CloneFastHTTPClientConfig(base)
+	// Derive the header-phase read bound from the base client's ReadTimeout
+	// (set from NetworkConfig.DefaultRequestTimeoutInSeconds, default 300s) BEFORE
+	// we zero the clone's — the unary client still has it. Falls back to a constant
+	// when the base has none, so the pre-header window is never fully ungoverned.
+	headerBound := base.ReadTimeout
+	if headerBound <= 0 {
+		headerBound = defaultHeaderReadBound
+	}
 	c.ReadTimeout = 0
+	// Stays zero by contract (AGENTS.md): this builder is shared by EVERY provider, so
+	// a finite cap would change non-passthrough streaming too. Residual: a provider that
+	// accepts TCP then stops reading a large request body blocks in Write.
 	c.WriteTimeout = 0
 	c.MaxConnDuration = 0
 	c.StreamResponseBody = true
+	// Bound only the wait for response headers; composes with base.Dial (SSRF dialer).
+	withHeaderDeadlineDial(c, headerBound)
 	return c
 }
 
@@ -2629,10 +2642,43 @@ func SetupStreamCancellation(ctx *schemas.BifrostContext, bodyStream io.Reader, 
 	done := make(chan struct{})
 	closed := make(chan struct{})
 
+	// A nil-ctx passthrough runs on a context.WithoutCancel child (isolatedPassthroughContext),
+	// whose Done() is nil — so ctx.Done() never fires on Shutdown(). The instance ctx's Done()
+	// was stashed under BifrostContextKeyShutdownDone; fold it into the same select so this
+	// already-bounded goroutine (killed by cleanup() at stream end) also observes shutdown.
+	shutdownDone, _ := ctx.Value(schemas.BifrostContextKeyShutdownDone).(<-chan struct{})
+
+	// When a conn handle is present (the passthrough stream path stashes one), a
+	// cancel/shutdown owner unblocks the parked read by moving the conn's read
+	// deadline into the past — NOT by closing the body stream. Closing from this
+	// third goroutine fires fasthttp's close callback (ReleaseReader +
+	// releaseRequestStream) while the reader is still parked inside
+	// requestStream.Read, so the reader's post-unblock `totalBytesRead/chunkLeft`
+	// writes land on a struct already zeroed and Put back to the pool
+	// (read-after-release). A deadline only interrupts the blocked syscall; the
+	// SINGLE release then runs on the reader goroutine via ReleaseStreamingResponse
+	// in its defer chain. These arms therefore take NO ConnectionClosed CAS — the
+	// reader must win it so ReleaseStreamingResponse actually releases (a cancel
+	// arm winning it would skip the release and leak the pooled objects to GC).
+	connHandle, _ := ctx.Value(schemas.BifrostContextKeyStreamConnHandle).(streamReadDeadliner)
+
 	go func() {
 		defer close(closed)
 		select {
+		case <-shutdownDone:
+			if connHandle != nil {
+				unblockParkedRead(connHandle)
+				return
+			}
+			if prev, _ := ctx.GetAndSetValue(schemas.BifrostContextKeyConnectionClosed, true).(bool); prev {
+				return
+			}
+			closeBodyStream(bodyStream, context.Canceled)
 		case <-ctx.Done():
+			if connHandle != nil {
+				unblockParkedRead(connHandle)
+				return
+			}
 			// Atomically claim the close. Only one owner (this goroutine, the
 			// idle-timeout timer, or ReleaseStreamingResponse) may close the
 			// non-idempotent fasthttp body stream: a second CloseWithError
@@ -2655,6 +2701,12 @@ func SetupStreamCancellation(ctx *schemas.BifrostContext, bodyStream io.Reader, 
 				}
 			}
 		case <-done:
+			// Normal stream end: the reader reached its defer chain (Read returned).
+			// With a conn handle there is nothing parked to unblock and the reader
+			// owns the release, so do nothing.
+			if connHandle != nil {
+				return
+			}
 			// Race between done and ctx.Done: the streaming goroutine has reached its defer
 			// chain (Read has returned), and ctx is also cancelled. The body may already be
 			// at EOF and fasthttp may have released the underlying conn to the idle pool.
@@ -2684,6 +2736,27 @@ func SetupStreamCancellation(ctx *schemas.BifrostContext, bodyStream io.Reader, 
 		close(done)
 		<-closed // Wait for goroutine to finish closing the stream before ReleaseStreamingResponse drains
 	}
+}
+
+// streamReadDeadliner is the small conn handle a passthrough stream stashes on
+// its context so cancellation/idle owners can unblock a parked body read by
+// moving the read deadline into the past. *headerDeadlineConn satisfies it.
+type streamReadDeadliner interface {
+	SetReadDeadline(t time.Time) error
+}
+
+// unblockParkedRead moves the conn's read deadline into the past, interrupting a
+// blocked conn.Read with os.ErrDeadlineExceeded WITHOUT invoking fasthttp's
+// pool-releasing close. Safe from any goroutine: SetReadDeadline only touches the
+// OS socket timer, never the pooled requestStream the reader is about to write.
+// The ordering that makes this sound is guaranteed by the caller: stopCancellation
+// blocks on <-closed before ReleaseStreamingResponse runs, so the conn cannot yet
+// be back in fasthttp's pool serving a different request when the deadline is set.
+func unblockParkedRead(h streamReadDeadliner) {
+	if h == nil {
+		return
+	}
+	_ = h.SetReadDeadline(time.Now())
 }
 
 // DefaultStreamIdleTimeout is how long a stream read can block with zero data
@@ -2735,16 +2808,23 @@ func closeBodyStream(bodyStream io.Reader, err error) {
 // if no data arrives within the configured timeout. This unblocks any pending
 // Read() call on the wrapped reader.
 type idleTimeoutReader struct {
-	ctx           *schemas.BifrostContext
-	reader        io.Reader
-	bodyStream    io.Reader // closed via type assertion to io.Closer on timeout
-	timeout       time.Duration
-	timer         *time.Timer
-	once          sync.Once
-	cleanupOnce   sync.Once
-	timerDoneOnce sync.Once
-	timerDone     chan struct{}
-	fired         atomic.Bool // set true when the idle timer fires
+	ctx *schemas.BifrostContext
+	// connHandleAtSetup is captured ONCE at construction, mirroring SetupStreamCancellation.
+	// Reading the context key lazily when the timer fires is unsafe: BifrostContext values are
+	// mutable and a caller may legally drive two concurrent passthrough streams on ONE context
+	// (verified via the public API), so the second stream overwrites the key and this stream's
+	// idle timer would move the read deadline on the OTHER stream's live connection — aborting
+	// an unrelated request while this one stays parked.
+	connHandleAtSetup streamReadDeadliner
+	reader            io.Reader
+	bodyStream        io.Reader // closed via type assertion to io.Closer on timeout
+	timeout           time.Duration
+	timer             *time.Timer
+	once              sync.Once
+	cleanupOnce       sync.Once
+	timerDoneOnce     sync.Once
+	timerDone         chan struct{}
+	fired             atomic.Bool // set true when the idle timer fires
 }
 
 // NewIdleTimeoutReader wraps reader with idle detection. If reader.Read() returns
@@ -2782,9 +2862,27 @@ func NewIdleTimeoutReader(reader io.Reader, bodyStream io.Reader, timeout time.D
 		timeout:    timeout,
 		timerDone:  make(chan struct{}),
 	}
+	if ctx != nil {
+		// StreamPassthrough stashes the handle before calling this constructor, so the
+		// value read here belongs to THIS stream.
+		r.connHandleAtSetup, _ = ctx.Value(schemas.BifrostContextKeyStreamConnHandle).(streamReadDeadliner)
+	}
 	r.timer = time.AfterFunc(timeout, func() {
 		defer r.timerDoneOnce.Do(func() { close(r.timerDone) })
 		r.once.Do(func() {
+			// Deadline path: when a conn handle is present the reader is parked
+			// inside requestStream.Read. Unblock it by moving the read deadline
+			// into the past — same read-after-release reasoning as
+			// SetupStreamCancellation: closing here would fire fasthttp's
+			// pool-releasing callback under the parked reader. Take NO
+			// ConnectionClosed CAS so the reader still wins it and releases the
+			// pooled objects via ReleaseStreamingResponse; r.fired keeps Read's
+			// error classification (ErrStreamIdleTimeout vs closed) accurate.
+			if connHandle, ok := r.connHandle(); ok {
+				r.fired.Store(true)
+				unblockParkedRead(connHandle)
+				return
+			}
 			// Atomically claim the close before tearing anything down. If a
 			// cancellation/release owner already closed the stream, do nothing:
 			// a second closeBodyStream re-runs releaseRequestStream and
@@ -2835,6 +2933,12 @@ func (r *idleTimeoutReader) connectionClosed() bool {
 	}
 	closed, ok := r.ctx.Value(schemas.BifrostContextKeyConnectionClosed).(bool)
 	return ok && closed
+}
+
+// connHandle returns the stream conn handle when the passthrough path stashed one,
+// selecting the deadline-based unblock over the pool-releasing close in the timer.
+func (r *idleTimeoutReader) connHandle() (streamReadDeadliner, bool) {
+	return r.connHandleAtSetup, r.connHandleAtSetup != nil
 }
 
 func (r *idleTimeoutReader) closedReadError() error {

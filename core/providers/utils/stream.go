@@ -26,9 +26,19 @@ import (
 // The ctx argument cancels the background forwarding goroutine if the consumer
 // abandons the returned wrapped channel. On ctx.Done the goroutine drains the
 // source stream so the upstream provider's blocked send can exit cleanly.
+//
+// classifyFirstChunk is an optional caller-supplied hook (only the
+// passthrough-stream-with-fallbacks path in core supplies one). A passthrough
+// stream surfaces a non-2xx upstream status as a data chunk
+// (BifrostPassthroughResponse.StatusCode), never as a BifrostError, so the
+// BifrostError predicate above can't see it. The hook converts an escalate-class
+// first chunk into a synthesized *BifrostError, which the existing retry+fallback
+// machinery already keys off. Callers that pass no hook (every non-passthrough
+// stream, and all direct callers) are byte-identical to before.
 func CheckFirstStreamChunkForError(
 	ctx context.Context,
 	stream chan *schemas.BifrostStreamChunk,
+	classifyFirstChunk ...func(*schemas.BifrostStreamChunk) *schemas.BifrostError,
 ) (chan *schemas.BifrostStreamChunk, <-chan struct{}, *schemas.BifrostError) {
 	firstChunk, ok := <-stream
 	if !ok {
@@ -39,17 +49,32 @@ func CheckFirstStreamChunkForError(
 		return nil, done, nil
 	}
 
-	// Check if first chunk is an error
-	if firstChunk.BifrostError != nil && firstChunk.BifrostError.Error != nil &&
-		(firstChunk.BifrostError.Error.Message != "" || firstChunk.BifrostError.Error.Code != nil || firstChunk.BifrostError.Error.Type != nil) {
-		// Drain source channel to let the provider goroutine exit cleanly
+	// drainInBackground lets the provider goroutine exit cleanly after the first
+	// chunk is claimed as an error: the source's remaining sends must be consumed
+	// so its blocked send unblocks. Callers wait on the returned channel before
+	// releasing plugin-pipeline resources the provider goroutine may still touch.
+	drainInBackground := func() <-chan struct{} {
 		done := make(chan struct{})
 		go func() {
 			defer close(done)
 			for range stream {
 			}
 		}()
-		return nil, done, firstChunk.BifrostError
+		return done
+	}
+
+	// Check if first chunk is an error
+	if firstChunk.BifrostError != nil && firstChunk.BifrostError.Error != nil &&
+		(firstChunk.BifrostError.Error.Message != "" || firstChunk.BifrostError.Error.Code != nil || firstChunk.BifrostError.Error.Type != nil) {
+		return nil, drainInBackground(), firstChunk.BifrostError
+	}
+
+	// Passthrough escalate-class status arrives as a data chunk, not a BifrostError.
+	// The hook (when supplied) synthesizes the *BifrostError the fallback loop needs.
+	for _, classify := range classifyFirstChunk {
+		if synthErr := classify(firstChunk); synthErr != nil {
+			return nil, drainInBackground(), synthErr
+		}
 	}
 
 	// First chunk is valid data — wrap channel to re-inject it
