@@ -734,3 +734,53 @@ func TestPassthroughContextKeysAreReserved(t *testing.T) {
 		}
 	}
 }
+
+// POOL RULE / 402. `perKeyFailureStatusCodes` (core/utils.go) treats 402 Payment Required as
+// a per-key account problem alongside 401/403/429 — another key in the pool may well be
+// funded. The passthrough classifier only listed 401 and 403, so a 402 fell through to
+// passthroughFailFast and was returned to the client on the FIRST key, with no rotation and
+// no bounded same-provider retry. The passthrough documentation promised the opposite
+// ("A pool-account symptom (401, 402, 403, 429) retries the same provider on a different
+// key"), so runtime and contract disagreed.
+//
+// Discriminator (revert-proof): drop 402 from passthroughPooledAccountStatusCodes and the
+// primary is called exactly once instead of spending its pooled budget.
+func TestPassthroughFailover_402RetriesSameNoEscalate(t *testing.T) {
+	var primaryHits, fallbackHits atomic.Int32
+
+	primarySrv := httptest.NewServer(statusHandler(http.StatusPaymentRequired, &primaryHits))
+	defer primarySrv.Close()
+	fallbackSrv := httptest.NewServer(statusHandler(http.StatusOK, &fallbackHits))
+	defer fallbackSrv.Close()
+
+	account := NewMockAccount()
+	account.AddProviderWithBaseURL(schemas.OpenAI, 1, 1, primarySrv.URL)
+	account.AddProviderWithBaseURL(schemas.Anthropic, 1, 1, fallbackSrv.URL)
+	account.SetKeysForProvider(schemas.OpenAI, []schemas.Key{
+		{ID: "k1", Value: *schemas.NewSecretVar("sk-k1"), Models: schemas.WhiteList{"*"}, Weight: 100},
+		{ID: "k2", Value: *schemas.NewSecretVar("sk-k2"), Models: schemas.WhiteList{"*"}, Weight: 100},
+	})
+	account.SetKeysForProvider(schemas.Anthropic, []schemas.Key{
+		{ID: "fb", Value: *schemas.NewSecretVar("sk-fb"), Models: schemas.WhiteList{"*"}, Weight: 100},
+	})
+	client := newPassthroughTestClient(t, account)
+
+	_, _ = doPassthrough(t, client, schemas.OpenAI,
+		[]schemas.Fallback{{Provider: schemas.Anthropic, Model: "claude-haiku"}})
+
+	t.Logf("pool 402: primary=%d fallback=%d (maxRetryPooled=%d)",
+		primaryHits.Load(), fallbackHits.Load(), passthroughMaxRetryPooled)
+
+	// THE POOL RULE: a billing problem on one key must try the pool, not fail on the first key.
+	if got := primaryHits.Load(); got < 2 {
+		t.Fatalf("primary attempted %d time(s), want >=2 — a 402 is a per-key account problem (see perKeyFailureStatusCodes) and must retry the same provider on another key instead of failing fast", got)
+	}
+	// ...bounded, like every other pooled status.
+	if got := primaryHits.Load(); got > int32(passthroughMaxRetryPooled)+1 {
+		t.Fatalf("primary attempted %d time(s), exceeds 1+passthroughMaxRetryPooled=%d — the pooled budget is unbounded for 402", got, passthroughMaxRetryPooled+1)
+	}
+	// ...and never promotes the request to a pricier provider.
+	if fallbackHits.Load() != 0 {
+		t.Fatalf("pricier fallback called %d time(s) — a pool 402 escalated cheap->expensive (POOL/MONEY RULE VIOLATION)", fallbackHits.Load())
+	}
+}

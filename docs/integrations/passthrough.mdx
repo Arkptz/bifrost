@@ -313,9 +313,12 @@ on its first failure:
 
 - A transient upstream failure (5xx, or a connection error) retries the **same** provider
   within a bounded budget before the ladder advances.
-- A pool-account symptom (401, 402, 403, 429) retries the same provider on a different key
-  from its pool and never escalates — a bad credential or a rate limit is not a reason to pay
-  a more expensive provider.
+- A pool-account symptom (401, 402, 403) retries the same provider on a different key from
+  its pool and never escalates — a rejected, unfunded, or blocked credential is not a reason
+  to pay a more expensive provider.
+- A rate limit (429) likewise retries the same provider, honoring `Retry-After`, and never
+  escalates on its own — an account-level limit is usually shared across that provider's keys,
+  so paying a pricier provider would not clear it.
 - A terminal, request-bound error (for example 400) is returned verbatim without touching the
   ladder, because retrying an invalid request cannot help.
 - The total number of upstream attempts across the whole ladder is bounded, so a long

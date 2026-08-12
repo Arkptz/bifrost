@@ -43,6 +43,7 @@ var passthroughFailFastStatusCodes = map[int]bool{
 // (never escalate to a pricier one) and cool the failed key so the retry avoids it.
 var passthroughPooledAccountStatusCodes = map[int]bool{
 	401: true, // Unauthorized — a pool account's key was rejected
+	402: true, // Payment Required — billing issue on this key's account; another key may be funded
 	403: true, // Forbidden — a pool account is blocked
 }
 
