@@ -6040,13 +6040,6 @@ func executeRequestWithRetries[T any](
 		}
 	}
 
-	// extraAttempts is upstream's encrypted-reasoning fail-soft grant. It stays in the
-	// bound so that behaviour is preserved, but it is forced to 0 under the passthrough
-	// pin: passthroughMaxTotalAttempts is only an honest bound if a leg makes exactly one
-	// physical call, and a fail-soft grant would silently add a second.
-	if single, _ := ctx.Value(schemas.BifrostContextKeyPassthroughSingleAttempt).(bool); single {
-		extraAttempts = 0
-	}
 	for attempts = 0; attempts <= maxRetries+extraAttempts; attempts++ {
 		ctx.SetValue(schemas.BifrostContextKeyNumberOfRetries, attemptBase+attempts)
 
@@ -6521,7 +6514,12 @@ func executeRequestWithRetries[T any](
 		// request one more attempt on the same key: the turn continues with summaries
 		// only instead of failing outright. Runs once per request.
 		lastWasEncryptedContentStrip = false
-		if !shouldRetry && !strippedEncryptedContent && isEncryptedReasoningRejection(bifrostError) &&
+		// The passthrough pin means this leg must make exactly ONE physical call, or
+		// passthroughMaxTotalAttempts stops being an honest bound and each extra call is
+		// unbilled. Gate the fail-soft here, at the increment: zeroing extraAttempts before
+		// the loop cannot hold, because this increment runs inside it.
+		passthroughSingleAttempt, _ := ctx.Value(schemas.BifrostContextKeyPassthroughSingleAttempt).(bool)
+		if !passthroughSingleAttempt && !shouldRetry && !strippedEncryptedContent && isEncryptedReasoningRejection(bifrostError) &&
 			stripResponsesEncryptedContent(ctx, req) {
 			strippedEncryptedContent = true
 			lastWasEncryptedContentStrip = true

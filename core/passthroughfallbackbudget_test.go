@@ -708,3 +708,29 @@ func TestPassthroughStreamFailover_FallbackLegRetrySameArmSpendsBudget(t *testin
 		t.Fatalf("cheap streaming fallback attempted %d time(s), exceeds 1+passthroughMaxRetrySame=%d — the retry-same budget is unbounded on the fallback leg", got, passthroughMaxRetrySame+1)
 	}
 }
+
+// RESERVED KEYS. BlockRestrictedWrites silently drops plugin writes to reserved context
+// keys (AGENTS.md gotcha #11). Every internal key this feature adds must therefore be
+// registered, or a plugin could overwrite failover state mid-request — that is how the
+// shutdown-hang defect was reintroduced once already. The registration list was
+// hand-resolved during the rebase onto a base 446 commits newer, and removing all five
+// entries left the entire suite green, so nothing guarded it. Discriminator (revert-proof):
+// drop any entry from reservedKeys and its write stops being blocked.
+func TestPassthroughContextKeysAreReserved(t *testing.T) {
+	keys := []schemas.BifrostContextKey{
+		schemas.BifrostContextKeyAttemptBase,
+		schemas.BifrostContextKeyPassthroughSingleAttempt,
+		schemas.BifrostContextKeyPassthroughRotatedKeys,
+		schemas.BifrostContextKeyShutdownDone,
+		schemas.BifrostContextKeyStreamConnHandle,
+	}
+	for _, k := range keys {
+		ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+		ctx.SetValue(k, "internal-value")
+		ctx.BlockRestrictedWrites()
+		ctx.SetValue(k, "plugin-override")
+		if got, _ := ctx.Value(k).(string); got != "internal-value" {
+			t.Fatalf("key %v: plugin write survived BlockRestrictedWrites (value=%q) — the key is missing from reservedKeys, so a plugin can overwrite internal failover state mid-request", k, got)
+		}
+	}
+}

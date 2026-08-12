@@ -327,3 +327,68 @@ func TestPassthroughStream_ConnHandleReachesCancellation(t *testing.T) {
 		t.Fatalf("stream did not deliver its body (status=%d body=%q) — test vacuous", status, body)
 	}
 }
+
+// CHUNK INDEX. Consumers key first-token latency off ChunkIndex == 0
+// (plugins/telemetry/main.go). Passthrough forwarded chunks never set the field, so every
+// chunk carried index 0 with its CUMULATIVE elapsed time, and the first-token histogram
+// grew with stream length instead of measuring TTFT. Forcing the stamp back to 0 leaves the
+// whole suite green, so the fix shipped unguarded — this closes that.
+// Discriminator (revert-proof): stamp 0 on every chunk and the indices stop being distinct.
+func TestPassthroughStream_ForwardedChunksCarryDistinctIndex(t *testing.T) {
+	const chunks = 3
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		fl, _ := w.(http.Flusher)
+		for i := 0; i < chunks; i++ {
+			fmt.Fprintf(w, "data: CHUNK-%d\n\n", i)
+			if fl != nil {
+				fl.Flush()
+			}
+			time.Sleep(2 * time.Millisecond)
+		}
+	}))
+	defer srv.Close()
+
+	account := NewMockAccount()
+	account.AddProviderWithBaseURL(schemas.OpenAI, 1, 1, srv.URL)
+	account.SetKeysForProvider(schemas.OpenAI, []schemas.Key{
+		{ID: "k", Value: *schemas.NewSecretVar("sk-k"), Models: schemas.WhiteList{"*"}, Weight: 100},
+	})
+	client := newPassthroughTestClient(t, account)
+
+	ctx := schemas.NewBifrostContext(context.Background(), time.Now().Add(30*time.Second))
+	ch, bifrostErr := client.PassthroughStream(ctx, schemas.OpenAI, &schemas.BifrostPassthroughRequest{
+		Method: http.MethodPost,
+		Path:   "/v1/messages",
+		Body:   []byte(`{"model":"m"}`),
+	})
+	if bifrostErr != nil {
+		t.Fatalf("passthrough stream failed: %s", bifrostErr.Error.Message)
+	}
+
+	var idx []int
+	var bodyChunks int
+	for chunk := range ch {
+		if chunk.BifrostPassthroughResponse == nil || len(chunk.BifrostPassthroughResponse.Body) == 0 {
+			continue
+		}
+		bodyChunks++
+		idx = append(idx, chunk.BifrostPassthroughResponse.ExtraFields.ChunkIndex)
+	}
+	t.Logf("forwarded chunk indices: %v (bodyChunks=%d)", idx, bodyChunks)
+
+	if bodyChunks < 2 {
+		t.Fatalf("only %d body chunk(s) forwarded (%v) — a single chunk cannot show an index sequence, test vacuous", bodyChunks, idx)
+	}
+	// Exactly one chunk may be index 0; the rest must advance, or every chunk lands in the
+	// first-token histogram.
+	zeros := 0
+	for _, v := range idx {
+		if v == 0 {
+			zeros++
+		}
+	}
+	if zeros != 1 {
+		t.Fatalf("%d of %d forwarded chunks carry ChunkIndex 0 (%v) — consumers treat index 0 as first-token, so every such chunk's cumulative latency is recorded as TTFT", zeros, len(idx), idx)
+	}
+}
