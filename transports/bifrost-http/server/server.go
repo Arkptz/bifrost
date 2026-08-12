@@ -2426,6 +2426,20 @@ func (s *BifrostHTTPServer) Bootstrap(ctx context.Context) error {
 		Handler:            handlers.SecurityHeadersMiddleware()(s.CORSMiddleware.Middleware()(handlers.RequestDecompressionMiddleware(s.Config)(s.Router.Handler))),
 		MaxRequestBodySize: s.Config.ClientConfig.MaxRequestBodySizeMB * 1024 * 1024,
 		ReadBufferSize:     s.Config.ServerConfig.ReadBufferSize,
+		// WriteTimeout is deliberately unset: it would cap legitimate long SSE streams.
+		// Keepalive instead detects a half-open (crashed/unplugged) peer, whose writes
+		// would otherwise stall on OS retransmit (~15m) holding the response goroutine
+		// and upstream connection.
+		//
+		// RESIDUAL (B2, server side): an ALIVE client that completes the TCP handshake
+		// but stops reading keeps ACKing keepalive/window probes, so keepalive never
+		// fires and a blocked response Write stays blocked until that client closes.
+		// fasthttp exposes no idle/stall write bound distinguishable from a "slow but
+		// progressing" long SSE stream, so there is no server-side knob that closes this
+		// without also capping legitimate streams. It is not closed here by design; the
+		// mitigation is upstream request-context cancellation, not a socket timeout.
+		TCPKeepalive:       true,
+		TCPKeepalivePeriod: 30 * time.Second,
 	}
 	startSkillsOrphanCleanupWorker(s.Ctx, s.Config)
 	// Keep the live model catalog current after boot. Without this, a model an
