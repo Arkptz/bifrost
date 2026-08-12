@@ -298,3 +298,37 @@ func TestPassthroughFailover_NoFallbacksUnchanged(t *testing.T) {
 		t.Fatalf("server hits = %d, want exactly 1 (no retry/escalation without fallbacks)", hits.Load())
 	}
 }
+
+func TestParsePassthroughRetryAfter(t *testing.T) {
+	future := time.Now().Add(3 * time.Second).UTC().Format(http.TimeFormat)
+	past := time.Now().Add(-time.Hour).UTC().Format(http.TimeFormat)
+
+	tests := []struct {
+		name    string
+		headers map[string]string
+		wantMin time.Duration
+		wantMax time.Duration
+	}{
+		{"absent", map[string]string{}, 0, 0},
+		{"delay seconds", map[string]string{"Retry-After": "5"}, 5 * time.Second, 5 * time.Second},
+		{"delay seconds capped", map[string]string{"Retry-After": "3600"}, passthroughRetryAfterCap, passthroughRetryAfterCap},
+		{"max int64 capped not zero", map[string]string{"Retry-After": "9223372036854775807"}, passthroughRetryAfterCap, passthroughRetryAfterCap},
+		{"negative", map[string]string{"Retry-After": "-5"}, 0, 0},
+		{"http date future honored", map[string]string{"Retry-After": future}, time.Second, 4 * time.Second},
+		{"http date past", map[string]string{"Retry-After": past}, 0, 0},
+		{"garbage", map[string]string{"Retry-After": "soon"}, 0, 0},
+		{"case insensitive header", map[string]string{"retry-after": "5"}, 5 * time.Second, 5 * time.Second},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := parsePassthroughRetryAfter(tt.headers)
+			if got < tt.wantMin || got > tt.wantMax {
+				t.Fatalf("parsePassthroughRetryAfter(%v) = %v, want within [%v, %v]", tt.headers, got, tt.wantMin, tt.wantMax)
+			}
+			if got < 0 || got > passthroughRetryAfterCap {
+				t.Fatalf("result %v escaped bounds [0, %v]", got, passthroughRetryAfterCap)
+			}
+		})
+	}
+}
